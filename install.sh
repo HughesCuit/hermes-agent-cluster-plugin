@@ -196,8 +196,9 @@ elif [[ "${DOWNLOAD}" == true ]]; then
         exit 1
     }
 else
-    install_binary_from_source || {
-        err "Could not build hermes-cluster from source."
+    # Default: try download first (no Go needed), fall back to source build
+    install_binary_from_download || install_binary_from_source || {
+        err "Could not install hermes-cluster binary."
         warn "Install Go 1.22+ and re-run, or use: bash install.sh --download"
         exit 1
     }

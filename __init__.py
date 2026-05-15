@@ -50,8 +50,71 @@ def _get_plugin_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _download_binary() -> Optional[Path]:
+    """Download pre-built hermes-cluster binary from GitHub Releases."""
+    import platform
+    import tempfile
+
+    target = _get_plugin_dir() / CLUSTER_BINARY
+    if target.exists():
+        return target
+
+    # Detect OS and architecture
+    system = platform.system().lower()  # Linux, Darwin, Windows
+    machine = platform.machine().lower()  # x86_64, aarch64
+
+    # Map to release asset naming
+    arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+    arch = arch_map.get(machine, machine)
+    os_name = system
+
+    asset_name = f"{CLUSTER_BINARY}-{os_name}-{arch}"
+    logger.info("Downloading %s from GitHub Releases...", asset_name)
+
+    try:
+        # Get latest release info
+        import urllib.request
+        import json
+
+        api_url = "https://api.github.com/repos/HughesCuit/hermes-agent-cluster/releases/latest"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "hermes-agent-cluster-plugin"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            release = json.loads(resp.read().decode())
+
+        # Find matching asset
+        download_url = None
+        for asset in release.get("assets", []):
+            if asset_name in asset["name"]:
+                download_url = asset["browser_download_url"]
+                break
+
+        if not download_url:
+            logger.warning("No pre-built binary found for %s in release %s",
+                          asset_name, release.get("tag_name", "latest"))
+            return None
+
+        # Download
+        logger.info("Downloading from %s...", download_url)
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            req = urllib.request.Request(download_url, headers={"User-Agent": "hermes-agent-cluster-plugin"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                tmp.write(resp.read())
+            tmp_path = tmp.name
+
+        # Move to target
+        import shutil as _shutil
+        _shutil.move(tmp_path, str(target))
+        os.chmod(target, 0o755)
+        logger.info("Downloaded hermes-cluster to %s", target)
+        return target
+
+    except Exception as e:
+        logger.warning("Download failed: %s", e)
+        return None
+
+
 def _find_or_install_binary() -> Optional[Path]:
-    """Find hermes-cluster in PATH or plugin dir. Auto-build if missing."""
+    """Find hermes-cluster in PATH or plugin dir. Auto-download/build if missing."""
     # 1. Check PATH
     which = shutil.which(CLUSTER_BINARY)
     if which:
@@ -71,14 +134,19 @@ def _find_or_install_binary() -> Optional[Path]:
         logger.info("Found hermes-cluster in ~/.local/bin: %s", local_bin2)
         return local_bin2
 
-    # 4. Try to build from source
+    # 4. Try to download pre-built binary from GitHub Releases
+    downloaded = _download_binary()
+    if downloaded:
+        return downloaded
+
+    # 5. Fallback: build from source (needs Go)
     built = _build_from_source()
     if built:
         return built
 
     logger.warning(
         "hermes-cluster binary not found. "
-        "Run the install script: bash %s/install.sh",
+        "Run the install script: bash %s/install.sh --download",
         _get_plugin_dir(),
     )
     return None
