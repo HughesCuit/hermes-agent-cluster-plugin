@@ -1,5 +1,5 @@
 name: hermes-agent-cluster
-version: 1.0.0
+version: 1.1.0
 description: "Distributed Hermes cluster — multi-node task coordination, capability-based scheduling, task dependencies, triggers, Web Dashboard, OpenTelemetry, Prometheus metrics, Plugin SDK, dynamic scheduler, multi-cluster federation, WAN cluster with TLS"
 author: "Heventure Group"
 manifest_version: 1
