@@ -5,6 +5,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [1.0.0] — 2026-05-14
+
+### Added
+- Plugin SDK (Webhook) — external services can listen to cluster task events via registered webhook URLs
+- Dynamic scheduler — load-aware task routing with priority queue and scoring
+- Multi-cluster federation — route tasks between independent clusters for cross-cluster workloads
+- WAN cluster support — TLS encryption, auto-reconnect with exponential backoff, batch event sync
+- Dashboard configuration panel — edit capabilities, view cluster config, restart service from UI
+- Full Hermes Admin Dashboard integration — "Cluster" tab with 17 REST API proxy endpoints
+
+### Changed
+- Go binary version: v1.0.0 stable release
+- Dashboard React UI: unified views for Config, Status, Nodes, Tasks, Leases
+- plugin_api.py: 17 FastAPI routes for complete cluster management
+- Enhanced error handling in `__init__.py` for binary detection and startup
+
+---
+
 ## [0.8.0] — 2026-05-10
 
 ### Added
@@ -105,6 +123,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 所有 hermes-agent-cluster-plugin 的重要变更记录。
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## [1.0.0] — 2026-05-14
+
+### 新增
+- Plugin SDK (Webhook) — 外部服务可注册 Webhook 监听集群任务事件
+- 动态调度器 — 负载感知路由 + 优先级队列 + 评分算法
+- 多集群联邦 — 跨集群任务路由与协调
+- WAN 集群支持 — TLS 加密、自动重连（指数退避）、批量事件同步
+- Dashboard 配置面板 — 图形化编辑 capabilities、查看配置、重启服务
+- 完整 Hermes Admin Dashboard 集成 — "Cluster" 标签页，17 个 REST API 代理端点
+
+### 变更
+- Go 二进制版本：v1.0.0 稳定版
+- Dashboard React UI：统一视图（Config / Status / Nodes / Tasks / Leases）
+- plugin_api.py：17 个 FastAPI 路由，完整集群管理
+- 增强 `__init__.py` 二进制检测与启动的错误处理
 
 ---
 

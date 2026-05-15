@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Plugin](https://img.shields.io/badge/Plugin-v0.8.0-orange)
+![Plugin](https://img.shields.io/badge/Plugin-v1.0.0-orange)
 
 **Hermes Agent cluster coordination plugin** — install with one command, get multiple Hermes Agent instances working together.
 
@@ -215,7 +215,7 @@ MIT — Copyright (c) Heventure Group
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Plugin](https://img.shields.io/badge/Plugin-v0.8.0-orange)
+![Plugin](https://img.shields.io/badge/Plugin-v1.0.0-orange)
 
 **Hermes 官方集群插件** — 一行命令安装，让多个 Hermes Agent 实例协同工作。
 
