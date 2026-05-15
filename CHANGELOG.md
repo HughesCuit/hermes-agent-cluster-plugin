@@ -237,3 +237,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - 插件注册到 Hermes Agent 工具系统
 - Go 二进制编译安装脚本
 - `cluster.yaml.example` 配置模板
+## [1.2.0] — 2026-05-14
+
+### Added
+- Config Management API (GET/PUT /config, /config/validate, /config/yaml, /config/restart)
+- Dashboard Config page with full configuration management UI
+- Hot restart endpoint
