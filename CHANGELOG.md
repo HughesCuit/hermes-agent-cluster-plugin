@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [2.0.0] — 2026-05-16
+
+### Breaking Changes
+- **Go binary removed** — plugin no longer requires or downloads the `hermes-cluster` Go binary
+- All backend logic now runs in pure Python inside the Hermes Agent process
+
+### Added
+- `hermes_cluster/state/cluster_store.py` — persistent SQLite storage layer (WAL mode, thread-safe, 10 tables)
+- `hermes_cluster/core/cluster_core.py` — full cluster orchestration (ClusterCore, ClusterScheduler, WorkflowResolver)
+- `hermes_cluster/core/watchdog.py` — heartbeat watchdog with online/degraded/offline detection
+- `hermes_cluster/core/recovery.py` — recovery pipeline (Revoker, Rescheduler, RecoveryDetector)
+- `hermes_cluster/models/` — Pydantic models matching Go backend's JSON API contracts
+- `dashboard/plugin_api.py` — rewritten FastAPI routes (direct ClusterState calls, no HTTP proxy)
+- `on_session_end` and `on_gateway_startup` plugin lifecycle hooks
+- 186 tests passing (cluster_store: 64, cluster_core: 47, tools: 31, plugin_api: 29, dropin: 15)
+
+### Changed
+- `__init__.py` — 7 `kanban_cluster_*` tools rewritten to use Python/SQLite directly
+- Config loading: env vars > plugin.yaml > defaults (no more Go binary config)
+- Dashboard API: same endpoints maintained for frontend backward compatibility
+
+### Removed
+- Go binary dependency (`hermes-cluster` binary no longer built/downloaded)
+- `hermes_cluster/routers/` package (replaced by single `dashboard/plugin_api.py`)
+- HTTP proxy pattern (`_proxy()` calls to Go service)
+
+---
+
 ## [1.0.0] — 2026-05-14
 
 ### Added

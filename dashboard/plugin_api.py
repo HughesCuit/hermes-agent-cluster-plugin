@@ -2,8 +2,16 @@
 hermes-agent-cluster dashboard plugin — backend API routes.
 
 Mounts at /api/plugins/agent-cluster/ via the Hermes Dashboard plugin system.
-Proxies requests to the hermes-cluster Go service.
-Supports config management: read/write cluster.yaml, runtime capability updates.
+
+REWRITE: Replaces HTTP proxy to Go service with direct FastAPI route calls
+against the in-memory ClusterState. Config management (YAML read/write) is
+retained as-is since it operates on local files.
+
+Changes from v1:
+  - Removed _proxy() HTTP helper — all cluster data comes from ClusterState
+  - Added _state module-level reference, initialized via init()
+  - Kept config management (YAML file I/O) unchanged
+  - Same API surface for dashboard frontend compatibility
 """
 
 from __future__ import annotations
@@ -13,8 +21,6 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, List, Optional
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 import yaml
 from fastapi import APIRouter, HTTPException
@@ -24,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Default cluster endpoint (can be overridden via POST /config)
-_CLUSTER_ENDPOINT = "http://127.0.0.1:8787"
+# Cluster state — set via init() before mounting the router
+_state = None  # ClusterState instance
 
 # Config file paths (checked in order)
 _CONFIG_PATHS = [
@@ -34,26 +40,26 @@ _CONFIG_PATHS = [
 ]
 
 
+def init(state) -> None:
+    """Initialize the plugin API with a ClusterState instance.
+
+    Called by the app factory or plugin loader before the router is mounted.
+    """
+    global _state
+    _state = state
+    logger.info("plugin_api initialized with cluster state")
+
+
+def _get_state():
+    """Get the cluster state, raising if not initialized."""
+    if _state is None:
+        raise HTTPException(status_code=503, detail="Cluster state not initialized")
+    return _state
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _proxy(method: str, path: str, data: dict = None) -> Any:
-    """Proxy an API call to the hermes-cluster Go service."""
-    url = f"{_CLUSTER_ENDPOINT}{path}"
-    body = json.dumps(data).encode() if data else None
-    req = Request(url, data=body, method=method)
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urlopen(req, timeout=10) as resp:
-            raw = resp.read().decode()
-            if raw.strip():
-                return json.loads(raw)
-            return {}
-    except URLError as e:
-        raise HTTPException(status_code=502, detail=f"Cluster proxy error: {e.reason}")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Cluster proxy error: {e}")
 
 
 def _read_config_file() -> tuple[Optional[dict], Optional[str], Optional[str]]:
@@ -90,22 +96,29 @@ class EndpointBody(BaseModel):
 
 @router.post("/config")
 async def set_endpoint(body: EndpointBody):
-    """Set the hermes-cluster Go service endpoint URL."""
-    global _CLUSTER_ENDPOINT
-    _CLUSTER_ENDPOINT = body.endpoint.rstrip("/")
-    logger.info("Cluster endpoint set to %s", _CLUSTER_ENDPOINT)
-    return {"ok": True, "endpoint": _CLUSTER_ENDPOINT}
+    """Set the cluster endpoint URL (for backward compat — now a no-op since
+    we call ClusterState directly, but kept for dashboard API compatibility)."""
+    logger.info("Cluster endpoint set to %s (direct mode, proxy ignored)", body.endpoint)
+    return {"ok": True, "endpoint": body.endpoint, "mode": "direct"}
 
 
 @router.get("/config")
 async def get_endpoint():
-    """Get the current hermes-cluster Go service endpoint URL."""
-    return {"ok": True, "endpoint": _CLUSTER_ENDPOINT}
+    """Get the current cluster endpoint. In direct mode, returns the state info."""
+    state = _get_state()
+    return {
+        "ok": True,
+        "endpoint": "direct",
+        "mode": "direct",
+        "cluster_id": state.cluster_id,
+        "node_id": state.node_id,
+    }
 
 
 @router.get("/config/node")
 async def get_node_config():
     """Get node configuration from config file and runtime."""
+    state = _get_state()
     cfg, raw_yaml, cfg_path = _read_config_file()
 
     result = {
@@ -116,6 +129,7 @@ async def get_node_config():
         "server": None,
         "lease": None,
         "watchdog": None,
+        "telemetry": None,
     }
 
     if cfg:
@@ -126,16 +140,18 @@ async def get_node_config():
         result["watchdog"] = cfg.get("watchdog", {})
         result["telemetry"] = cfg.get("telemetry", {})
 
-    # Try to get runtime node info from Go service
-    try:
-        nodes = _proxy("GET", "/api/v1/nodes")
-        if isinstance(nodes, list) and nodes:
-            # Merge runtime status (online/offline) into result
-            runtime_map = {n["id"]: n for n in nodes}
-            node_id = (result.get("node") or {}).get("id", "")
-            if node_id and node_id in runtime_map:
-                result["runtime"] = runtime_map[node_id]
-    except HTTPException:
+    # Get runtime node info directly from state
+    node_id = (result.get("node") or {}).get("id", state.node_id)
+    node = state.get_node(node_id)
+    if node:
+        result["runtime"] = {
+            "id": node.id,
+            "name": node.name,
+            "status": node.status.value if hasattr(node.status, "value") else node.status,
+            "capabilities": node.capabilities,
+            "load": node.load,
+        }
+    else:
         result["runtime"] = None
 
     return result
@@ -148,11 +164,12 @@ class CapabilitiesBody(BaseModel):
 @router.put("/config/capabilities")
 async def update_capabilities(body: CapabilitiesBody):
     """Update node capabilities at runtime AND persist to config file."""
+    state = _get_state()
     cfg, raw_yaml, cfg_path = _read_config_file()
     if not cfg:
         raise HTTPException(status_code=404, detail="Config file not found")
 
-    node_id = (cfg.get("node") or {}).get("id", "node_main")
+    node_id = (cfg.get("node") or {}).get("id", state.node_id)
     caps = body.capabilities
 
     # 1. Update in config file
@@ -162,15 +179,21 @@ async def update_capabilities(body: CapabilitiesBody):
     saved_path = _write_config_file(cfg)
     logger.info("Saved capabilities to %s: %s", saved_path, caps)
 
-    # 2. Update at runtime via Go API (best-effort)
+    # 2. Update at runtime via ClusterState (direct call, no HTTP proxy)
     runtime_result = None
     try:
-        runtime_result = _proxy("PATCH", f"/api/v1/nodes/{node_id}/capabilities", {
+        state.update_capabilities(node_id, caps)
+        # Re-trigger scheduling
+        state.trigger_pending_tasks()
+        state.schedule_pending()
+        runtime_result = {
+            "node_id": node_id,
             "capabilities": caps,
-        })
-        logger.info("Runtime capability update result: %s", runtime_result)
-    except HTTPException:
-        runtime_result = {"warning": "Cluster service not reachable, saved to config only"}
+            "status": "updated",
+        }
+        logger.info("Runtime capability update applied directly")
+    except Exception as e:
+        runtime_result = {"warning": f"Runtime update failed: {e}"}
 
     return {
         "ok": True,
@@ -190,6 +213,7 @@ class NodeConfigBody(BaseModel):
 @router.put("/config/node")
 async def update_node_config(body: NodeConfigBody):
     """Update node identity in config file (requires restart for most fields)."""
+    state = _get_state()
     cfg, raw_yaml, cfg_path = _read_config_file()
     if not cfg:
         raise HTTPException(status_code=404, detail="Config file not found")
@@ -207,18 +231,21 @@ async def update_node_config(body: NodeConfigBody):
 
     saved_path = _write_config_file(cfg)
 
-    # Runtime capability update if capabilities changed
+    # Runtime capability update if capabilities changed (direct call)
     runtime_result = None
     if "capabilities" in changed:
-        node_id = cfg["node"].get("id", "node_main")
+        node_id = cfg["node"].get("id", state.node_id)
         try:
-            runtime_result = _proxy(
-                "PATCH",
-                f"/api/v1/nodes/{node_id}/capabilities",
-                {"capabilities": cfg["node"]["capabilities"]},
-            )
-        except HTTPException:
-            runtime_result = {"warning": "Cluster not reachable"}
+            state.update_capabilities(node_id, cfg["node"]["capabilities"])
+            state.trigger_pending_tasks()
+            state.schedule_pending()
+            runtime_result = {
+                "node_id": node_id,
+                "capabilities": cfg["node"]["capabilities"],
+                "status": "updated",
+            }
+        except Exception as e:
+            runtime_result = {"warning": f"Runtime update failed: {e}"}
 
     return {
         "ok": True,
@@ -260,35 +287,16 @@ async def save_config_yaml(body: YamlBody):
 
 @router.post("/config/restart")
 async def restart_service():
-    """Attempt to restart the hermes-cluster service."""
-    import shutil
-    import subprocess
+    """Attempt to restart the hermes-cluster service.
 
-    cfg_path = str(_CONFIG_PATHS[0])
-    if not Path(cfg_path).exists():
-        raise HTTPException(status_code=404, detail="Config file not found")
-
-    binary = shutil.which("hermes-cluster")
-    if not binary:
-        raise HTTPException(status_code=404, detail="hermes-cluster binary not found in PATH")
-
-    try:
-        # Find and kill existing process
-        result = subprocess.run(
-            ["pkill", "-f", "hermes-cluster"],
-            capture_output=True, text=True, timeout=5,
-        )
-        logger.info("pkill result: %s", result.stdout or result.stderr or "ok")
-
-        # Start new process
-        proc = subprocess.Popen(
-            [binary, "-config", cfg_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return {"ok": True, "pid": proc.pid, "config": cfg_path}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Restart failed: {e}")
+    In direct mode, this is a no-op since the cluster runs in-process.
+    Returns success with a note that restart is not needed.
+    """
+    return {
+        "ok": True,
+        "mode": "direct",
+        "message": "Running in direct mode — restart not required",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -298,35 +306,80 @@ async def restart_service():
 
 @router.get("/health")
 async def health():
-    """Check if the cluster service is reachable."""
+    """Check if the cluster state is available."""
     try:
-        result = _proxy("GET", "/api/v1/nodes")
-        return {"ok": True, "nodes": len(result) if isinstance(result, list) else 0}
+        state = _get_state()
+        nodes = state.get_all_nodes()
+        return {"ok": True, "nodes": len(nodes), "mode": "direct"}
     except HTTPException:
-        return {"ok": False, "error": "Cluster service unreachable"}
+        return {"ok": False, "error": "Cluster state not initialized"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
-# Cluster Data
+# Cluster Data — direct ClusterState calls (no HTTP proxy)
 # ---------------------------------------------------------------------------
 
 
 @router.get("/nodes")
 async def list_nodes():
     """List all cluster nodes."""
-    return _proxy("GET", "/api/v1/nodes")
+    state = _get_state()
+    nodes = state.get_all_nodes()
+    # Serialize to dict list for JSON response
+    return [
+        {
+            "id": n.id,
+            "name": n.name,
+            "capabilities": n.capabilities,
+            "status": n.status.value if hasattr(n.status, "value") else n.status,
+            "last_heartbeat": n.last_heartbeat.isoformat() if n.last_heartbeat else "",
+            "load": n.load,
+        }
+        for n in nodes
+    ]
 
 
 @router.get("/tasks")
 async def list_tasks():
     """List all cluster tasks."""
-    return _proxy("GET", "/api/v1/tasks")
+    state = _get_state()
+    tasks = state.get_all_tasks()
+    return [
+        {
+            "id": t.id,
+            "title": t.title,
+            "requires": t.requires,
+            "depends_on": t.depends_on,
+            "priority": t.priority,
+            "status": t.status.value if hasattr(t.status, "value") else t.status,
+            "assigned_to": t.assigned_to,
+            "created_at": t.created_at.isoformat() if t.created_at else "",
+            "updated_at": t.updated_at.isoformat() if t.updated_at else "",
+            "version": t.version,
+            "fail_reason": t.fail_reason,
+        }
+        for t in tasks
+    ]
 
 
 @router.get("/leases")
 async def list_leases():
     """List all active leases."""
-    return _proxy("GET", "/api/v1/leases")
+    state = _get_state()
+    leases = state.get_active_leases()
+    return [
+        {
+            "id": l.id,
+            "task_id": l.task_id,
+            "node_id": l.node_id,
+            "created_at": l.created_at.isoformat() if l.created_at else "",
+            "expires_at": l.expires_at.isoformat() if l.expires_at else "",
+            "status": l.status.value if hasattr(l.status, "value") else l.status,
+        }
+        for l in leases
+    ]
 
 
 @router.get("/status")
@@ -336,36 +389,88 @@ async def get_status(
     capability: str = "",
 ):
     """Get global cluster status view with optional filters."""
-    params = []
-    if node:
-        params.append(f"node={node}")
-    if status:
-        params.append(f"status={status}")
-    if capability:
-        params.append(f"capability={capability}")
-    qs = "?" + "&".join(params) if params else ""
-    return _proxy("GET", f"/api/v1/status{qs}")
+    state = _get_state()
+    tasks = state.get_all_tasks()
+    nodes = state.get_all_nodes()
+
+    # Build entries matching Go's status view
+    entries = []
+    for task in tasks:
+        entry = {
+            "task_id": task.id,
+            "title": task.title,
+            "status": task.status.value if hasattr(task.status, "value") else task.status,
+            "priority": task.priority,
+            "assigned_to": task.assigned_to,
+            "requires": task.requires,
+        }
+        # Filter
+        if node and task.assigned_to != node:
+            continue
+        if status and entry["status"] != status:
+            continue
+        if capability and capability not in task.requires:
+            continue
+        entries.append(entry)
+
+    # Build summary
+    task_counts = state.task_counts()
+    summary = {
+        "total_tasks": task_counts["total"],
+        "pending": task_counts.get("pending", 0),
+        "ready": task_counts.get("ready", 0),
+        "running": task_counts.get("running", 0),
+        "completed": task_counts.get("completed", 0),
+        "failed": task_counts.get("failed", 0),
+        "total_nodes": state.node_count(),
+        "online_nodes": state.online_count(),
+    }
+
+    return {"entries": entries, "summary": summary}
 
 
 @router.get("/topology")
 async def get_topology():
     """Get cluster topology."""
-    return _proxy("GET", "/api/v1/cluster/topology")
+    state = _get_state()
+    nodes = state.get_all_nodes()
+    return {
+        "nodes": [
+            {
+                "id": n.id,
+                "name": n.name,
+                "status": n.status.value if hasattr(n.status, "value") else n.status,
+                "capabilities": n.capabilities,
+                "load": n.load,
+            }
+            for n in nodes
+        ],
+    }
 
 
 @router.get("/cluster-metrics")
 async def get_cluster_metrics():
     """Get aggregated cluster metrics."""
-    return _proxy("GET", "/api/v1/cluster/metrics")
+    state = _get_state()
+    task_counts = state.task_counts()
+    return {
+        "nodes": {"total": state.node_count(), "online": state.online_count()},
+        "tasks": task_counts,
+        "sync_version": state.sync_version(),
+    }
 
 
 @router.get("/timeline")
 async def get_timeline():
     """Get cluster event timeline."""
-    return _proxy("GET", "/api/v1/cluster/timeline")
+    state = _get_state()
+    events = state.get_recovery_events()
+    # Return most recent 50 events
+    return events[-50:] if len(events) > 50 else events
 
 
 @router.get("/workflow/graph")
 async def get_workflow_graph():
     """Get workflow dependency graph."""
-    return _proxy("GET", "/api/v1/workflow/graph")
+    state = _get_state()
+    return state.get_workflow_graph()
