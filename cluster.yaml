@@ -1,0 +1,34 @@
+cluster:
+  id: my-cluster
+  role: main                # "main" or "worker"
+  endpoint: ""              # worker only: main node URL (e.g. "http://server:8787")
+  token: ""                 # auth token (optional)
+
+node:
+  id: node_main
+  name: main-node
+  capabilities:
+    - planning
+    - reviewing
+    - scheduling
+
+server:
+  bind: "0.0.0.0"
+  port: 8787
+
+lease:
+  ttl: 30s
+  scan_rate: 5s
+
+watchdog:
+  check_interval: 3s
+  degraded_after: 10s
+  offline_after: 20s
+
+telemetry:
+  enabled: false
+  exporter: "none"          # "otlp", "stdout", "none"
+  endpoint: "localhost:4317"
+  service_name: "hermes-agent-cluster"
+  sample_rate: 1.0
+  batch_timeout: 5s
