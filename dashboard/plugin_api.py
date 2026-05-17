@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -46,6 +47,11 @@ def _ensure_state():
     if _state is not None:
         return _state
     try:
+        # Add plugin root to sys.path so hermes_cluster is importable
+        plugin_root = str(Path(__file__).resolve().parent.parent)
+        if plugin_root not in sys.path:
+            sys.path.insert(0, plugin_root)
+
         from hermes_cluster.state.cluster_store import ClusterStore
         db_path = os.path.expanduser("~/.hermes/agent-cluster/cluster.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
