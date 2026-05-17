@@ -30,14 +30,31 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Cluster state — set via init() before mounting the router
-_state = None  # ClusterState instance
+# Cluster state — auto-initialized from hermes_cluster on first request
+_state = None  # ClusterStore instance
 
 # Config file paths (checked in order)
 _CONFIG_PATHS = [
     Path.home() / ".hermes" / "agent-cluster" / "cluster.yaml",
     Path.home() / ".hermes" / "agent-cluster" / "cluster-worker.yaml",
 ]
+
+
+def _ensure_state():
+    """Lazy-init ClusterStore if not already initialized."""
+    global _state
+    if _state is not None:
+        return _state
+    try:
+        from hermes_cluster.state.cluster_store import ClusterStore
+        db_path = os.path.expanduser("~/.hermes/agent-cluster/cluster.db")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        _state = ClusterStore(db_path)
+        logger.info("plugin_api: ClusterStore auto-initialized from %s", db_path)
+    except Exception as e:
+        logger.warning("plugin_api: Failed to auto-init ClusterStore: %s", e)
+        _state = None
+    return _state
 
 
 def init(state) -> None:
@@ -51,7 +68,8 @@ def init(state) -> None:
 
 
 def _get_state():
-    """Get the cluster state, raising if not initialized."""
+    """Get the cluster state, auto-initializing if needed."""
+    _ensure_state()
     if _state is None:
         raise HTTPException(status_code=503, detail="Cluster state not initialized")
     return _state

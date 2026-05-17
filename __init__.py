@@ -442,6 +442,12 @@ def register(ctx) -> None:
 
     logger.info("hermes-agent-cluster plugin: 7 tools registered (pure Python, no Go binary)")
 
+    # Register lifecycle hooks
+    ctx.register_hook("on_session_start", on_session_start)
+    ctx.register_hook("on_session_end", on_session_end)
+    ctx.register_hook("on_gateway_startup", on_gateway_startup)
+    logger.info("hermes-agent-cluster plugin: 3 hooks registered")
+
 
 # ---------------------------------------------------------------------------
 # Plugin Lifecycle
