@@ -127,8 +127,8 @@
       newCap: '',
       restarting: false,
     });
-    var state = state[0];
-    var setState = state[1];
+    var state = _useState[0];
+    var setState = _useState[1];
     var nodeConfig = state.config;
 
     var refresh = hooks.useCallback(function () {
