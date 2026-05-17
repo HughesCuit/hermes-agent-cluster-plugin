@@ -267,6 +267,34 @@ async def get_config_yaml():
     }
 
 
+@router.get("/config/validate")
+async def validate_config():
+    """Validate the current cluster configuration."""
+    cfg, _, _ = _read_config_file()
+    errors = []
+    warnings = []
+
+    # Check required fields
+    if not cfg:
+        errors.append("No configuration file found")
+    else:
+        cluster = cfg.get("cluster", {})
+        node = cfg.get("node", {})
+        server = cfg.get("server", {})
+
+        if not cluster.get("id"):
+            warnings.append("cluster.id not set (using default)")
+        if not node.get("id"):
+            warnings.append("node.id not set")
+        if not node.get("name"):
+            warnings.append("node.name not set")
+        port = server.get("port", 8787)
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            errors.append(f"server.port must be 1-65535, got {port}")
+
+    return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
+
+
 class YamlBody(BaseModel):
     yaml: str
 

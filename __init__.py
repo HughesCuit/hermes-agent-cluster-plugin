@@ -1,8 +1,8 @@
 """
 hermes-agent-cluster plugin — Distributed Hermes cluster coordination.
 
-Auto-installs the hermes-cluster Go binary (builds from source or downloads),
-then registers 7 kanban_cluster_* tools for multi-node task orchestration.
+Pure Python implementation. No Go binary needed.
+Registers 7 kanban_cluster_* tools for multi-node task orchestration.
 """
 
 from __future__ import annotations
@@ -10,15 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
-import subprocess
-import sys
-import threading
-import time
 from pathlib import Path
-from typing import Any, Dict, Optional
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -27,494 +20,369 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "hermes-agent-cluster"
-CLUSTER_BINARY = "hermes-cluster"
-RELEASES_URL = "https://api.github.com/repos/HughesCuit/hermes-agent-cluster/releases/latest"
-REPO_URL = "https://github.com/HughesCuit/hermes-agent-cluster.git"
 
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
-_cluster_config: Dict[str, Any] = {}
-_heartbeat_thread: Optional[threading.Thread] = None
-_heartbeat_stop = threading.Event()
-_binary_ready = False
+_core = None  # ClusterCore instance
 
 
-# ---------------------------------------------------------------------------
-# Binary management
-# ---------------------------------------------------------------------------
+def _get_core():
+    """Lazy-init ClusterCore (SQLite-backed, runs in-process)."""
+    global _core
+    if _core is not None:
+        return _core
 
-def _get_plugin_dir() -> Path:
-    """Return the plugin directory under ~/.hermes/plugins/."""
-    return Path(__file__).resolve().parent
+    from hermes_cluster.state.cluster_store import ClusterStore
+    from hermes_cluster.core.cluster_core import ClusterCore
 
+    db_path = os.path.expanduser("~/.hermes/agent-cluster/cluster.db")
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-def _download_binary() -> Optional[Path]:
-    """Download pre-built hermes-cluster binary from GitHub Releases."""
-    import platform
-    import tempfile
-
-    target = _get_plugin_dir() / CLUSTER_BINARY
-    if target.exists():
-        return target
-
-    # Detect OS and architecture
-    system = platform.system().lower()  # Linux, Darwin, Windows
-    machine = platform.machine().lower()  # x86_64, aarch64
-
-    # Map to release asset naming
-    arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
-    arch = arch_map.get(machine, machine)
-    os_name = system
-
-    asset_name = f"{CLUSTER_BINARY}-{os_name}-{arch}"
-    logger.info("Downloading %s from GitHub Releases...", asset_name)
-
-    try:
-        import urllib.request
-        import urllib.error
-        import json
-
-        # Build headers — use GITHUB_TOKEN if available for higher rate limits
-        headers = {"User-Agent": "hermes-agent-cluster-plugin"}
-        github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-        if github_token:
-            headers["Authorization"] = f"token {github_token}"
-
-        # Get latest release info
-        api_url = "https://api.github.com/repos/HughesCuit/hermes-agent-cluster/releases/latest"
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            release = json.loads(resp.read().decode())
-
-        # Find matching asset
-        download_url = None
-        for asset in release.get("assets", []):
-            if asset_name in asset["name"]:
-                download_url = asset["browser_download_url"]
-                break
-
-        if not download_url:
-            logger.warning("No pre-built binary found for %s in release %s",
-                          asset_name, release.get("tag_name", "latest"))
-            return None
-
-        # Download
-        logger.info("Downloading from %s...", download_url)
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            req = urllib.request.Request(download_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                tmp.write(resp.read())
-            tmp_path = tmp.name
-
-        # Move to target
-        import shutil as _shutil
-        _shutil.move(tmp_path, str(target))
-        os.chmod(target, 0o755)
-        logger.info("Downloaded hermes-cluster to %s", target)
-        return target
-
-    except urllib.error.HTTPError as e:
-        if e.code == 403:
-            logger.warning("GitHub API rate limit exceeded. Set GITHUB_TOKEN for higher limits.")
-        else:
-            logger.warning("Download failed: HTTP %s", e.code)
-        return None
-    except Exception as e:
-        logger.warning("Download failed: %s", e)
-        return None
+    store = ClusterStore(db_path)
+    _core = ClusterCore(store)
+    _core.start()
+    logger.info("ClusterCore initialized: db=%s", db_path)
+    return _core
 
 
-def _find_or_install_binary() -> Optional[Path]:
-    """Find hermes-cluster in PATH or plugin dir. Auto-download/build if missing."""
-    # 1. Check PATH
-    which = shutil.which(CLUSTER_BINARY)
-    if which:
-        logger.info("Found hermes-cluster in PATH: %s", which)
-        return Path(which)
-
-    # 2. Check plugin dir
-    local_bin = _get_plugin_dir() / CLUSTER_BINARY
-    if local_bin.exists():
-        logger.info("Found hermes-cluster in plugin dir: %s", local_bin)
-        os.chmod(local_bin, 0o755)
-        return local_bin
-
-    # 3. Check ~/.local/bin
-    local_bin2 = Path.home() / ".local" / "bin" / CLUSTER_BINARY
-    if local_bin2.exists():
-        logger.info("Found hermes-cluster in ~/.local/bin: %s", local_bin2)
-        return local_bin2
-
-    # 4. Try to download pre-built binary from GitHub Releases
-    downloaded = _download_binary()
-    if downloaded:
-        return downloaded
-
-    # 5. Fallback: build from source (needs Go)
-    built = _build_from_source()
-    if built:
-        return built
-
-    logger.warning(
-        "hermes-cluster binary not found. "
-        "Run the install script: bash %s/install.sh --download",
-        _get_plugin_dir(),
-    )
-    return None
-
-
-def _build_from_source() -> Optional[Path]:
-    """Clone main repo and build hermes-cluster binary."""
-    go_exe = shutil.which("go")
-    if not go_exe:
-        logger.warning("Go is not installed. Cannot build hermes-cluster from source.")
-        return None
-
-    import tempfile
-
-    target = _get_plugin_dir() / CLUSTER_BINARY
-    if target.exists():
-        return target
-
-    logger.info("Building hermes-cluster from source (this may take a moment)...")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        try:
-            result = subprocess.run(
-                ["git", "clone", "--depth", "1", REPO_URL, str(tmp_path / "src")],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode != 0:
-                logger.warning("Git clone failed: %s", result.stderr.strip())
-                return None
-
-            src_dir = tmp_path / "src"
-            result = subprocess.run(
-                [go_exe, "build", "-o", str(target), "./cmd/cluster"],
-                capture_output=True, text=True, timeout=300,
-                cwd=str(src_dir),
-            )
-            if result.returncode != 0:
-                logger.warning("Go build failed: %s", result.stderr.strip())
-                return None
-
-            os.chmod(target, 0o755)
-            logger.info("Built hermes-cluster at %s", target)
-            return target
-
-        except subprocess.TimeoutExpired:
-            logger.warning("Build timed out.")
-            return None
-        except FileNotFoundError as e:
-            logger.warning("Build failed: %s", e)
-            return None
-
-
-# ---------------------------------------------------------------------------
-# HTTP helper
-# ---------------------------------------------------------------------------
-
-def _api_call(base_url: str, method: str, path: str, data: dict = None) -> dict:
-    url = f"{base_url}{path}"
-    body = json.dumps(data).encode() if data else None
-    req = Request(url, data=body, method=method)
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
-    except URLError as e:
-        return {"error": str(e)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Tool handlers
-# ---------------------------------------------------------------------------
-
-def handle_cluster_init(args: dict, **kwargs) -> str:
-    """Initialize a new cluster (main node)."""
-    port = args.get("port", 8787)
-    node_id = args.get("node_id", "node_main")
-    capabilities = args.get("capabilities", ["planning", "reviewing", "scheduling"])
-
-    config_dir = Path.home() / ".hermes" / "agent-cluster"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / "cluster.yaml"
-
-    config_content = f"""cluster:
-  id: {args.get("cluster_id", "hermes-cluster")}
-  role: main
-  token: "{args.get("token", "")}"
-
-node:
-  id: {node_id}
-  name: main-node
-  capabilities:
-{chr(10).join(f"    - {c}" for c in capabilities)}
-
-server:
-  bind: "0.0.0.0"
-  port: {port}
-
-lease:
-  ttl: 30s
-  scan_rate: 5s
-
-watchdog:
-  check_interval: 3s
-  degraded_after: 10s
-  offline_after: 20s
-"""
-    config_path.write_text(config_content)
-
-    binary = _find_or_install_binary()
-    if not binary:
-        return json.dumps({"error": "hermes-cluster binary not found. Run the install script first."})
-
-    try:
-        proc = subprocess.Popen(
-            [str(binary), "-config", str(config_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+def _to_json(obj: Any) -> str:
+    """Serialize to JSON string, handling Pydantic models and datetimes."""
+    if hasattr(obj, "dict"):
+        return json.dumps(obj.dict(), default=str, ensure_ascii=False)
+    if hasattr(obj, "__dict__"):
+        return json.dumps(
+            {k: v for k, v in obj.__dict__.items() if not k.startswith("_")},
+            default=str,
+            ensure_ascii=False,
         )
-        _cluster_config["process"] = proc
-        _cluster_config["base_url"] = f"http://127.0.0.1:{port}"
-        _cluster_config["node_id"] = node_id
-        _cluster_config["role"] = "main"
-        time.sleep(1)
-
-        return json.dumps({
-            "status": "initialized",
-            "node_id": node_id,
-            "role": "main",
-            "port": port,
-            "pid": proc.pid,
-            "config": str(config_path),
-        })
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def handle_cluster_join(args: dict, **kwargs) -> str:
-    """Join an existing cluster as worker."""
-    endpoint = args.get("endpoint", "http://127.0.0.1:8787")
-    node_id = args.get("node_id", "node_worker")
-    capabilities = args.get("capabilities", ["coding", "gpu", "browser"])
-    port = args.get("port", 8788)
-
-    config_dir = Path.home() / ".hermes" / "agent-cluster"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / "cluster-worker.yaml"
-
-    config_content = f"""cluster:
-  id: {args.get("cluster_id", "hermes-cluster")}
-  role: worker
-  endpoint: "{endpoint}"
-  token: "{args.get("token", "")}"
-
-node:
-  id: {node_id}
-  name: worker-node
-  capabilities:
-{chr(10).join(f"    - {c}" for c in capabilities)}
-
-server:
-  bind: "0.0.0.0"
-  port: {port}
-
-lease:
-  ttl: 30s
-  scan_rate: 5s
-
-watchdog:
-  check_interval: 3s
-  degraded_after: 10s
-  offline_after: 20s
-"""
-    config_path.write_text(config_content)
-
-    binary = _find_or_install_binary()
-    if not binary:
-        return json.dumps({"error": "hermes-cluster binary not found. Run the install script first."})
-
-    try:
-        proc = subprocess.Popen(
-            [str(binary), "-config", str(config_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        _cluster_config["process"] = proc
-        _cluster_config["base_url"] = f"http://127.0.0.1:{port}"
-        _cluster_config["node_id"] = node_id
-        _cluster_config["role"] = "worker"
-        time.sleep(1)
-
-        result = _api_call(endpoint, "POST", "/api/v1/nodes/join", {
-            "node_name": node_id,
-            "capabilities": capabilities,
-            "endpoint": f"http://127.0.0.1:{port}",
-        })
-
-        return json.dumps({
-            "status": "joined",
-            "node_id": node_id,
-            "role": "worker",
-            "endpoint": endpoint,
-            "port": port,
-            "pid": proc.pid,
-            "join_response": result,
-        })
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def handle_cluster_submit(args: dict, **kwargs) -> str:
-    base_url = _cluster_config.get("base_url")
-    if not base_url:
-        return json.dumps({"error": "Not connected to cluster. Run kanban_cluster_init or kanban_cluster_join first."})
-    result = _api_call(base_url, "POST", "/api/v1/tasks", {
-        "title": args.get("title", "Untitled task"),
-        "requires": args.get("requires", []),
-    })
-    return json.dumps(result)
-
-
-def handle_cluster_list(args: dict, **kwargs) -> str:
-    base_url = _cluster_config.get("base_url")
-    if not base_url:
-        return json.dumps({"error": "Not connected to cluster."})
-    result = _api_call(base_url, "GET", "/api/v1/tasks")
-    return json.dumps(result, indent=2)
-
-
-def handle_cluster_nodes(args: dict, **kwargs) -> str:
-    base_url = _cluster_config.get("base_url")
-    if not base_url:
-        return json.dumps({"error": "Not connected to cluster."})
-    result = _api_call(base_url, "GET", "/api/v1/nodes")
-    return json.dumps(result, indent=2)
-
-
-def handle_cluster_heartbeat(args: dict, **kwargs) -> str:
-    base_url = _cluster_config.get("base_url")
-    node_id = _cluster_config.get("node_id")
-    if not base_url or not node_id:
-        return json.dumps({"error": "Not connected to cluster."})
-    result = _api_call(base_url, "POST", "/api/v1/nodes/heartbeat", {
-        "node_id": node_id,
-    })
-    return json.dumps(result)
-
-
-def handle_cluster_complete(args: dict, **kwargs) -> str:
-    base_url = _cluster_config.get("base_url")
-    node_id = _cluster_config.get("node_id")
-    if not base_url:
-        return json.dumps({"error": "Not connected to cluster."})
-    task_id = args.get("task_id")
-    if not task_id:
-        return json.dumps({"error": "task_id is required"})
-    result = _api_call(base_url, "POST", f"/api/v1/tasks/{task_id}/complete", {
-        "node_id": node_id,
-        "result": args.get("result", "completed"),
-    })
-    return json.dumps(result)
+    return json.dumps(obj, default=str, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
-# Tool schemas
+# Tool Schemas
 # ---------------------------------------------------------------------------
 
 CLUSTER_INIT_SCHEMA = {
-    "name": "kanban_cluster_init",
-    "description": "Initialize a new hermes-agent-cluster cluster. This node becomes the main/coordinator node.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "port": {"type": "integer", "description": "Port to listen on", "default": 8787},
-            "node_id": {"type": "string", "description": "This node's unique ID"},
-            "cluster_id": {"type": "string", "description": "Cluster identifier"},
-            "capabilities": {"type": "array", "items": {"type": "string"}, "description": "Node capabilities"},
-            "token": {"type": "string", "description": "Cluster auth token"},
+    "type": "object",
+    "properties": {
+        "cluster_id": {"type": "string", "description": "Cluster identifier"},
+        "role": {
+            "type": "string",
+            "enum": ["main", "worker"],
+            "description": "Node role",
+            "default": "main",
+        },
+        "node_name": {"type": "string", "description": "Name for this node"},
+        "capabilities": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Node capabilities (e.g. coding, gpu, browser)",
+            "default": [],
+        },
+        "port": {
+            "type": "integer",
+            "description": "Port to listen on",
+            "default": 8787,
         },
     },
+    "required": ["node_name"],
 }
 
 CLUSTER_JOIN_SCHEMA = {
-    "name": "kanban_cluster_join",
-    "description": "Join an existing hermes-agent-cluster cluster as a worker node.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "endpoint": {"type": "string", "description": "Main node URL (e.g. http://main:8787)"},
-            "node_id": {"type": "string", "description": "This node's unique ID"},
-            "port": {"type": "integer", "description": "Port to listen on", "default": 8788},
-            "cluster_id": {"type": "string", "description": "Cluster identifier"},
-            "capabilities": {"type": "array", "items": {"type": "string"}, "description": "Node capabilities"},
-            "token": {"type": "string", "description": "Cluster auth token"},
+    "type": "object",
+    "properties": {
+        "endpoint": {
+            "type": "string",
+            "description": "Main node URL (e.g. http://192.168.1.100:8787)",
         },
-        "required": ["endpoint"],
+        "token": {"type": "string", "description": "Cluster join token"},
+        "node_name": {"type": "string", "description": "Name for this worker node"},
+        "capabilities": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Node capabilities",
+            "default": [],
+        },
     },
+    "required": ["endpoint", "node_name"],
 }
 
 CLUSTER_SUBMIT_SCHEMA = {
-    "name": "kanban_cluster_submit",
-    "description": "Submit a task to the cluster for distributed execution.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "title": {"type": "string", "description": "Task title/description"},
-            "requires": {"type": "array", "items": {"type": "string"}, "description": "Required capabilities"},
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "description": "Task title"},
+        "body": {"type": "string", "description": "Task description (ignored, for future use)", "default": ""},
+        "priority": {
+            "type": "integer",
+            "description": "Task priority (1=highest, 5=lowest)",
+            "default": 3,
         },
-        "required": ["title"],
+        "required_capabilities": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Required node capabilities",
+            "default": [],
+        },
+        "dependencies": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Task IDs this task depends on",
+            "default": [],
+        },
     },
+    "required": ["title"],
 }
 
 CLUSTER_LIST_SCHEMA = {
-    "name": "kanban_cluster_list",
-    "description": "List all tasks in the cluster.",
-    "parameters": {"type": "object", "properties": {}},
+    "type": "object",
+    "properties": {
+        "status": {
+            "type": "string",
+            "description": "Filter by status (pending/ready/running/completed/failed)",
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Max results",
+            "default": 20,
+        },
+    },
 }
 
-CLUSTER_NODES_SCHEMA = {
-    "name": "kanban_cluster_nodes",
-    "description": "List all nodes in the cluster.",
-    "parameters": {"type": "object", "properties": {}},
-}
+CLUSTER_NODES_SCHEMA = {"type": "object", "properties": {}}
 
 CLUSTER_HEARTBEAT_SCHEMA = {
-    "name": "kanban_cluster_heartbeat",
-    "description": "Send heartbeat to the cluster to indicate this node is alive.",
-    "parameters": {"type": "object", "properties": {}},
+    "type": "object",
+    "properties": {
+        "node_id": {"type": "string", "description": "Node ID to heartbeat"},
+        "load_score": {
+            "type": "number",
+            "description": "Current load (0.0-1.0)",
+            "default": 0.0,
+        },
+    },
+    "required": ["node_id"],
 }
 
 CLUSTER_COMPLETE_SCHEMA = {
-    "name": "kanban_cluster_complete",
-    "description": "Mark a task as completed with results.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "task_id": {"type": "string", "description": "Task ID to complete"},
-            "result": {"type": "string", "description": "Task result/description"},
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "string", "description": "Task ID to complete"},
+        "result": {
+            "type": "string",
+            "description": "Task result/output",
+            "default": "",
         },
-        "required": ["task_id"],
     },
+    "required": ["task_id"],
 }
 
 
 # ---------------------------------------------------------------------------
-# Plugin registration
+# Tool Handlers
+# ---------------------------------------------------------------------------
+
+def handle_cluster_init(args: dict, **kwargs) -> str:
+    """Initialize a distributed kanban cluster (creates this node)."""
+    try:
+        from hermes_cluster.models import Node, NodeStatus
+
+        core = _get_core()
+        node_name = args.get("node_name", "main-node")
+        role = args.get("role", "main")
+        capabilities = args.get("capabilities", [])
+
+        node = Node(
+            id=f"node_{node_name}",
+            name=node_name,
+            capabilities=capabilities,
+            status=NodeStatus.online,
+        )
+        core.store.register_node(node)
+
+        # Save config
+        cfg = core.store.get_config() or {}
+        cfg["cluster_id"] = args.get("cluster_id", "hermes-cluster")
+        cfg["node_id"] = node.id
+        cfg["node_role"] = role
+        core.store.set_config(cfg)
+
+        return _to_json({
+            "ok": True,
+            "node_id": node.id,
+            "node_name": node.name,
+            "role": role,
+            "capabilities": capabilities,
+            "message": f"Cluster initialized. Node '{node_name}' registered as {role}.",
+        })
+    except Exception as e:
+        logger.exception("cluster_init failed")
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+def handle_cluster_join(args: dict, **kwargs) -> str:
+    """Join an existing kanban cluster as a worker node."""
+    try:
+        from hermes_cluster.models import Node, NodeStatus
+
+        core = _get_core()
+        node_name = args.get("node_name", "worker-node")
+        capabilities = args.get("capabilities", [])
+        endpoint = args.get("endpoint", "")
+
+        node = Node(
+            id=f"node_{node_name}",
+            name=node_name,
+            capabilities=capabilities,
+            status=NodeStatus.online,
+        )
+        core.store.register_node(node)
+
+        cfg = core.store.get_config() or {}
+        cfg["cluster_endpoint"] = endpoint
+        cfg["node_id"] = node.id
+        cfg["node_role"] = "worker"
+        core.store.set_config(cfg)
+
+        return _to_json({
+            "ok": True,
+            "node_id": node.id,
+            "node_name": node.name,
+            "role": "worker",
+            "endpoint": endpoint,
+            "message": f"Joined cluster. Node '{node_name}' registered as worker.",
+        })
+    except Exception as e:
+        logger.exception("cluster_join failed")
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+def handle_cluster_submit(args: dict, **kwargs) -> str:
+    """Submit a task to the cluster (auto-schedules to matching node)."""
+    try:
+        core = _get_core()
+
+        # Set dependencies if provided
+        dependencies = args.get("dependencies", [])
+
+        task = core.submit_task(
+            title=args["title"],
+            requires=args.get("required_capabilities", []),
+            priority=args.get("priority", 3),
+        )
+
+        # Set dependencies after creation (if any)
+        if dependencies:
+            core.store.set_dependencies(task.id, dependencies)
+
+        return _to_json({
+            "ok": True,
+            "task_id": task.id,
+            "title": task.title,
+            "status": task.status.value if hasattr(task.status, "value") else str(task.status),
+            "assigned_to": task.assigned_to,
+            "message": f"Task submitted: {task.title}",
+        })
+    except Exception as e:
+        logger.exception("cluster_submit failed")
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+def handle_cluster_list(args: dict, **kwargs) -> str:
+    """List cluster tasks with optional status filter."""
+    try:
+        core = _get_core()
+        status_filter = args.get("status")
+        limit = args.get("limit", 20)
+
+        tasks = core.store.get_all_tasks()
+        if status_filter:
+            tasks = [t for t in tasks if t.status.value == status_filter]
+
+        result = []
+        for t in tasks[:limit]:
+            result.append({
+                "id": t.id,
+                "title": t.title,
+                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+                "assigned_to": t.assigned_to,
+                "requires": t.requires,
+                "priority": t.priority,
+            })
+        return _to_json({"ok": True, "tasks": result, "total": len(tasks)})
+    except Exception as e:
+        logger.exception("cluster_list failed")
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+def handle_cluster_nodes(args: dict, **kwargs) -> str:
+    """List all cluster nodes with status and capabilities."""
+    try:
+        core = _get_core()
+        nodes = core.store.get_all_nodes()
+        result = []
+        for n in nodes:
+            result.append({
+                "id": n.id,
+                "name": n.name,
+                "status": n.status.value if hasattr(n.status, "value") else str(n.status),
+                "capabilities": n.capabilities,
+                "load": n.load,
+            })
+        return _to_json({"ok": True, "nodes": result, "total": len(nodes)})
+    except Exception as e:
+        logger.exception("cluster_nodes failed")
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+def handle_cluster_heartbeat(args: dict, **kwargs) -> str:
+    """Send a heartbeat to keep the node online."""
+    try:
+        core = _get_core()
+        node_id = args["node_id"]
+
+        core.store.update_heartbeat(node_id)
+        return _to_json({
+            "ok": True,
+            "node_id": node_id,
+            "message": "Heartbeat recorded.",
+        })
+    except Exception as e:
+        logger.exception("cluster_heartbeat failed")
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+def handle_cluster_complete(args: dict, **kwargs) -> str:
+    """Mark a task as completed (triggers dependent tasks)."""
+    try:
+        core = _get_core()
+        task_id = args["task_id"]
+
+        ok = core.complete_task(task_id)
+        if ok:
+            return _to_json({
+                "ok": True,
+                "task_id": task_id,
+                "message": "Task completed. Dependent tasks have been triggered.",
+            })
+        else:
+            return _to_json({
+                "ok": False,
+                "task_id": task_id,
+                "error": "Task not found or not in completable state.",
+            })
+    except Exception as e:
+        logger.exception("cluster_complete failed")
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Plugin Registration
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
     """Register kanban cluster tools with Hermes Agent."""
-    # Try to ensure binary is available
-    _find_or_install_binary()
-
     ctx.register_tool(
         name="kanban_cluster_init",
         toolset="kanban_cluster",
@@ -545,14 +413,14 @@ def register(ctx) -> None:
         schema=CLUSTER_LIST_SCHEMA,
         handler=handle_cluster_list,
         description="List cluster tasks",
-        emoji="📊",
+        emoji="📋",
     )
     ctx.register_tool(
         name="kanban_cluster_nodes",
         toolset="kanban_cluster",
         schema=CLUSTER_NODES_SCHEMA,
         handler=handle_cluster_nodes,
-        description="List cluster nodes",
+        description="List cluster nodes and their capabilities",
         emoji="🖥️",
     )
     ctx.register_tool(
@@ -560,7 +428,7 @@ def register(ctx) -> None:
         toolset="kanban_cluster",
         schema=CLUSTER_HEARTBEAT_SCHEMA,
         handler=handle_cluster_heartbeat,
-        description="Send cluster heartbeat",
+        description="Send a heartbeat to keep the node online",
         emoji="💓",
     )
     ctx.register_tool(
@@ -568,24 +436,53 @@ def register(ctx) -> None:
         toolset="kanban_cluster",
         schema=CLUSTER_COMPLETE_SCHEMA,
         handler=handle_cluster_complete,
-        description="Complete a cluster task",
+        description="Mark a task as completed",
         emoji="✅",
     )
 
-    logger.info("hermes-agent-cluster plugin: 7 tools registered")
+    logger.info("hermes-agent-cluster plugin: 7 tools registered (pure Python, no Go binary)")
 
 
 # ---------------------------------------------------------------------------
-# Hooks
+# Plugin Lifecycle
 # ---------------------------------------------------------------------------
 
 def on_session_start(ctx) -> None:
-    """Ensure binary is available when a session starts."""
-    binary = _find_or_install_binary()
-    if binary:
-        logger.info("hermes-cluster binary ready: %s", binary)
-    else:
-        logger.warning(
-            "hermes-cluster not installed. Install it: bash %s/install.sh",
-            _get_plugin_dir(),
+    """Ensure ClusterCore is initialized when a session starts."""
+    try:
+        core = _get_core()
+        summary = core.get_summary()
+        logger.info(
+            "ClusterCore ready: %d nodes, %d tasks",
+            summary.get("total_nodes", 0),
+            summary.get("total_tasks", 0),
         )
+    except Exception as e:
+        logger.warning("ClusterCore init failed: %s", e)
+
+
+def on_gateway_startup(ctx) -> None:
+    """Initialize ClusterCore on gateway startup."""
+    try:
+        core = _get_core()
+        # Also initialize the dashboard API
+        try:
+            from dashboard.plugin_api import init as init_dashboard
+            init_dashboard(core.store)
+            logger.info("Dashboard API initialized with ClusterStore")
+        except ImportError:
+            pass
+        logger.info("hermes-agent-cluster: ClusterCore started on gateway startup")
+    except Exception as e:
+        logger.warning("hermes-agent-cluster: startup init failed: %s", e)
+
+
+def on_session_end(ctx) -> None:
+    """Clean up on session end."""
+    global _core
+    if _core is not None:
+        try:
+            _core.stop()
+        except Exception:
+            pass
+        _core = None
