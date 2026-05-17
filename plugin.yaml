@@ -1,8 +1,8 @@
 name: hermes-agent-cluster
-version: 2.0.0
+version: 2.0.2
 description: "Distributed Hermes cluster — pure Python backend (no Go binary). SQLite persistence, FastAPI routes, capability-aware scheduling, task dependencies, heartbeat watchdog, recovery pipeline, Web Dashboard, Plugin SDK, federation."
 author: "Heventure Group"
-manifest_version: 1
+manifest_version: 2.0.2
 hooks:
   - on_session_start
   - on_session_end
